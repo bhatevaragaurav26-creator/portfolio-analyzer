@@ -1,0 +1,8 @@
+﻿portfolio,ticker,amount,amount1,amount2,count
+Core,AAPL,3000,1000,0,0
+Core,MSFT,2000,500,250,0
+Core,MSFT,0,0,0,5
+Growth,NVDA,2500,0,0,0
+Growth,TSLA,0,0,0,8
+Dividend,KO,1200,300,0,0
+Dividend,PG,800,0,100,0
