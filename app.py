@@ -1,428 +1,629 @@
-# app.py  — Portfolio Analyzer (robust FX + validation + MC)
-import streamlit as st
-import pandas as pd
+# app.py — Portfolio Analyzer Pro (2025-ready)
+# --------------------------------------------
+# Features:
+# - Currency conversion to a chosen base (auto-detect asset currency; suffix fallbacks)
+# - Two portfolios (A & B) with side-by-side metrics and charts
+# - Historical VaR / CVaR
+# - Multi-factor beta decomposition vs multiple benchmarks (OLS)
+# - Fully updated to Streamlit width="stretch"/"content" (no use_container_width)
+#
+# Requirements:
+#   pip install streamlit yfinance pandas numpy plotly reportlab (optional for PDF)
+#
+# Notes:
+# - Yahoo FX pairs are formatted like "USDINR=X" (INR per 1 USD).
+# - We convert each asset's price into the selected base currency using FX series.
+# - If currency cannot be detected from yfinance, we infer from ticker suffix (.NS,.BO=.INR; .L=.GBP; .TO=.CAD; .HK=.HKD)
+# - Factor regression is simple OLS on daily returns; interpret as educational (not production investment advice).
+
+import io
+from datetime import date, datetime, timedelta
+
 import numpy as np
+import pandas as pd
+import streamlit as st
 import yfinance as yf
-from datetime import datetime, date
+import plotly.express as px
+import plotly.graph_objects as go
 
-# ---------- Page ----------
-st.set_page_config(page_title="Portfolio Analyzer", layout="wide")
-st.title("Portfolio Analyzer")
+# ---------------- Page ----------------
+st.set_page_config(page_title="Portfolio Analyzer Pro", layout="wide")
+st.title("📊 Portfolio Analyzer Pro")
+st.caption("Currency conversion, A/B compare, VaR/CVaR, and factor betas — modernized for Streamlit’s `width=` API.")
 
-# ---------- Core helpers ----------
+# ---------------- Helpers ----------------
 def to_dt(d):
-    if isinstance(d, datetime): return d
-    if isinstance(d, date): return datetime.combine(d, datetime.min.time())
+    if isinstance(d, datetime):
+        return d
+    if isinstance(d, date):
+        return datetime.combine(d, datetime.min.time())
     return datetime.today()
 
-def cagr(start_val, end_val, start_dt, end_dt):
-    years = (end_dt - start_dt).days / 365.25
-    return (end_val/start_val)**(1/years) - 1 if start_val > 0 and years > 0 else np.nan
-
-def annualize_vol(returns: pd.Series):
-    return returns.std(ddof=1) * np.sqrt(252) if not returns.empty else np.nan
-
-def compute_beta(rp: pd.Series, rb: pd.Series):
-    df = pd.concat([rp, rb], axis=1).dropna()
-    if len(df) < 30: return np.nan
-    cov = np.cov(df.iloc[:,0], df.iloc[:,1])[0,1]
-    varb = np.var(df.iloc[:,1])
-    return cov/varb if varb > 0 else np.nan
-
-def fetch_adj_close(tickers, start, end):
-    """Fetch adjusted close; returns columns=tickers, index=date."""
-    tickers = [t.strip().upper() for t in tickers if str(t).strip()]
-    if not tickers: return pd.DataFrame()
-    data = yf.download(tickers, start=start, end=end, auto_adjust=True,
-                       progress=False, group_by="ticker", threads=True)
-    prices = None
-    if isinstance(data, pd.DataFrame) and isinstance(data.columns, pd.MultiIndex):
-        lvl1 = data.columns.get_level_values(1)
-        field = "Adj Close" if "Adj Close" in lvl1 else ("Close" if "Close" in lvl1 else None)
-        prices = data.xs(field, axis=1, level=1) if field is not None else data.xs(lvl1.unique()[0], axis=1, level=1)
-    elif isinstance(data, pd.DataFrame):
-        if "Adj Close" in data.columns:
-            s = data["Adj Close"]; prices = s.to_frame() if isinstance(s, pd.Series) else s
-            if len(tickers) == 1: prices.columns = [tickers[0]]
-        elif "Close" in data.columns:
-            s = data["Close"]; prices = s.to_frame() if isinstance(s, pd.Series) else s
-            if len(tickers) == 1: prices.columns = [tickers[0]]
-        else:
-            prices = data.copy()
-    else:
-        prices = pd.DataFrame()
-    if prices is None or prices.empty: return pd.DataFrame()
-    if isinstance(prices, pd.Series): prices = prices.to_frame()
-    return prices.sort_index().ffill().dropna(how="all")
-
-def portfolio_series(prices: pd.DataFrame, amounts_map: dict) -> pd.Series:
-    """Allocate by invested amounts at start -> infer shares -> sum to series."""
-    first = prices.ffill().bfill().iloc[0]
-    shares = {}
-    for t, amt in amounts_map.items():
-        if t in first and float(first[t]) > 0:
-            shares[t] = float(amt) / float(first[t])
-    if not shares: return pd.Series(dtype=float)
-    return (prices[list(shares.keys())] * pd.Series(shares)).sum(axis=1)
-
-# ---------- Validation with suggestions ----------
-COMMON_SUFFIXES = [".L",".NS",".NSE",".BO",".TO",".V",".AX",".HK",".PA",".F",".SW",".SA",".MI",".SG",".TW",".KS",".KQ"]
-
-def has_recent_data(tkr):
+def _np_isfinite(x):
     try:
-        df = yf.download(tkr, period="5d", interval="1d", progress=False, auto_adjust=True)
-        return isinstance(df, pd.DataFrame) and df.shape[0] >= 1
+        return np.isfinite(x)
     except Exception:
         return False
 
-def suggest_variants(ticker):
-    out = []
-    for suf in COMMON_SUFFIXES:
-        cand = f"{ticker}{suf}"
-        if has_recent_data(cand):
-            out.append(cand)
-        if len(out) >= 5: break
-    return out
+def cagr_from_prices(pr: pd.Series) -> float:
+    s = pr.dropna()
+    if s.shape[0] < 2 or s.iloc[0] <= 0:
+        return np.nan
+    years = (s.index[-1] - s.index[0]).days / 365.25
+    if years <= 0:
+        return np.nan
+    return (s.iloc[-1] / s.iloc[0]) ** (1 / years) - 1
 
-def validate_and_suggest(tickers):
-    valid, invalid, suggestions = [], [], {}
-    for t in tickers:
-        if has_recent_data(t): valid.append(t)
+def ann_vol(ret: pd.Series, per_year=252) -> float:
+    r = ret.dropna()
+    if r.empty:
+        return np.nan
+    return r.std(ddof=0) * np.sqrt(per_year)
+
+def sharpe(ret: pd.Series, rf=0.0, per_year=252) -> float:
+    r = ret.dropna()
+    if r.empty:
+        return np.nan
+    ex = r - (rf / per_year)
+    vol = ex.std(ddof=0)
+    if vol == 0 or np.isnan(vol):
+        return np.nan
+    return (ex.mean() * per_year) / vol
+
+def max_drawdown_from_returns(ret: pd.Series) -> float:
+    r = ret.dropna()
+    if r.empty:
+        return np.nan
+    cum = (1 + r).cumprod()
+    peak = cum.cummax()
+    dd = (cum / peak) - 1
+    return dd.min()
+
+def hist_var_cvar(ret: pd.Series, cl=0.95):
+    """Historical VaR/CVaR of *daily* returns (positive number means loss %)."""
+    r = ret.dropna()
+    if r.empty:
+        return (np.nan, np.nan)
+    q = np.quantile(r, 1 - cl)  # e.g., 5th percentile for 95% CL
+    var = -q
+    cvar = -r[r <= q].mean() if (r <= q).any() else np.nan
+    return (var, cvar)
+
+def safe_download_prices(tickers, start, end, interval="1d"):
+    """Adj Close in native currency per asset."""
+    if not tickers:
+        return pd.DataFrame()
+    try:
+        data = yf.download(
+            tickers=tickers,
+            start=start.date(),
+            end=(end + timedelta(days=1)).date(),  # include end date
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker"
+        )
+        # Normalize columns -> simple dataframe [Date x tickers]
+        if isinstance(data.columns, pd.MultiIndex):
+            cols = []
+            if "Adj Close" in set(l for _, l in data.columns):
+                for t in tickers:
+                    if (t, "Adj Close") in data.columns:
+                        cols.append(data[(t, "Adj Close")].rename(t))
+            elif "Close" in set(l for _, l in data.columns):
+                for t in tickers:
+                    if (t, "Close") in data.columns:
+                        cols.append(data[(t, "Close")].rename(t))
+            prices = pd.concat(cols, axis=1) if cols else pd.DataFrame(index=data.index)
         else:
-            invalid.append(t)
-            s = suggest_variants(t)
-            if s: suggestions[t] = s
-    return valid, invalid, suggestions
+            # Single series
+            single = data.rename(columns={"Adj Close": tickers[0], "Close": tickers[0]})
+            prices = single[[tickers[0]]] if tickers[0] in single.columns else pd.DataFrame(index=single.index)
+        prices = prices.sort_index().ffill().dropna(how="all")
+        return prices
+    except Exception as e:
+        st.error(f"Price download error: {e}")
+        return pd.DataFrame()
 
-# ---------- Cached metadata ----------
-@st.cache_data(ttl=60*60*12, show_spinner=False)
-def cached_sector(ticker):
+def detect_currency(ticker: str) -> str:
+    # Fast detection via yfinance; fallback by suffix rules
     try:
-        info = yf.Ticker(ticker).info
-        return (info.get("sector") or "Unknown")
-    except Exception:
-        return "Unknown"
-
-def get_sectors(tickers):
-    return {t: cached_sector(t) for t in tickers}
-
-@st.cache_data(ttl=60*60*12, show_spinner=False)
-def cached_currency(ticker):
-    try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(ticker).fast_info
         cur = info.get("currency")
-        return str(cur).upper() if cur else "USD"
+        if cur:
+            return cur.upper()
     except Exception:
-        return "USD"
+        pass
+    # Suffix heuristics
+    if ticker.endswith(".NS") or ticker.endswith(".BO"):
+        return "INR"
+    if ticker.endswith(".L"):
+        return "GBP"
+    if ticker.endswith(".TO"):
+        return "CAD"
+    if ticker.endswith(".HK"):
+        return "HKD"
+    if ticker.endswith(".AX"):
+        return "AUD"
+    if ticker.endswith(".TW"):
+        return "TWD"
+    if ticker.endswith(".T"):
+        return "JPY"
+    # Default to USD if unknown
+    return "USD"
 
-# ---------- Robust FX conversion ----------
-def _fx_series_yahoo(pair, start, end):
-    df = yf.download(pair, start=start, end=end, auto_adjust=True, progress=False)
-    if isinstance(df, pd.DataFrame) and "Adj Close" in df.columns:
-        return df["Adj Close"].rename(pair).ffill()
-    if isinstance(df, pd.DataFrame) and "Close" in df.columns:
-        return df["Close"].rename(pair).ffill()
-    return pd.Series(dtype=float)
-
-def fetch_fx_pair_robust(base_ccy, tgt_ccy, start, end):
-    """Return a Series converting 1 unit of base_ccy -> tgt_ccy.
-       Try BASETGT=X, else TGTPASE=X and invert."""
-    base = (base_ccy or "USD").upper().strip()
-    tgt  = (tgt_ccy  or "USD").upper().strip()
-    if base == tgt:
-        return pd.Series(dtype=float).rename(f"{base}{tgt}=X")
-    direct = f"{base}{tgt}=X"
-    fx = _fx_series_yahoo(direct, start, end)
-    if fx is not None and not fx.empty:
-        return fx
-    inv = _fx_series_yahoo(f"{tgt}{base}=X", start, end)
-    if inv is not None and not inv.empty:
-        inv = inv.replace(0, np.nan).dropna()
-        if not inv.empty:
-            return (1.0 / inv).rename(direct)
-    return pd.Series(dtype=float).rename(direct)
-
-def convert_prices_to_target_robust(prices_df, start, end, target_ccy, currency_map, *, on_fail="error"):
-    """Convert each ticker column from its native currency -> target_ccy.
-       on_fail='error'  -> raise ValueError listing failed tickers
-       on_fail='skip'   -> drop failed tickers"""
-    tgt = (target_ccy or "USD").upper().strip()
-    if prices_df.empty:
-        return prices_df
-    converted = prices_df.copy()
-    failed = []
-    for t in list(prices_df.columns):
-        base = (currency_map.get(t) or "USD").upper().strip()
-        if base == tgt:
-            continue
-        fx = fetch_fx_pair_robust(base, tgt, start, end)
-        if fx is None or fx.empty:
-            failed.append((t, base)); continue
-        aligned = pd.concat([prices_df[t].rename("P"), fx.rename("FX")], axis=1).dropna()
-        if aligned.empty:
-            failed.append((t, base)); continue
-        converted.loc[aligned.index, t] = aligned["P"] * aligned["FX"]
-    if failed:
-        msg = ", ".join([f"{t}({b})" for t, b in failed])
-        if on_fail == "skip":
-            to_drop = [t for t, _ in failed]
-            converted.drop(columns=to_drop, inplace=True, errors="ignore")
+def fetch_fx_pair_series(curr_from: str, curr_to: str, start: datetime, end: datetime, interval="1d") -> pd.Series:
+    """Return FX series as 'units of TO per 1 FROM'. If same currency -> ones."""
+    cf = curr_from.upper()
+    ct = curr_to.upper()
+    if cf == ct:
+        # unity series matching expected index (we'll align later)
+        idx = pd.date_range(start=start.date(), end=end.date(), freq="D")
+        return pd.Series(1.0, index=idx, name=f"{cf}{ct}=X")
+    pair = f"{cf}{ct}=X"  # e.g., USDINR=X (INR per USD)
+    try:
+        df = yf.download(pair, start=start.date(), end=(end + timedelta(days=1)).date(),
+                         interval=interval, progress=False, auto_adjust=False)
+        # Prefer 'Adj Close' else 'Close'
+        if "Adj Close" in df.columns:
+            s = df["Adj Close"].rename(pair).ffill()
         else:
-            raise ValueError(f"FX conversion missing for: {msg}")
-    return converted.dropna(axis=1, how="all")
+            s = df["Close"].rename(pair).ffill()
+        return s
+    except Exception:
+        return pd.Series(dtype=float, name=pair)
 
-# ---------- Monte Carlo ----------
-def simulate_gbm_from_series(port_series, years_ahead=5, n_paths=5000, seed=42):
-    s = port_series.dropna()
-    if s.shape[0] < 30:
-        return None, "Not enough history (need at least ~30 daily observations)."
-    daily = s.pct_change().dropna()
-    mu_daily = daily.mean(); sigma_daily = daily.std(ddof=1)
-    mu_ann = (1 + mu_daily) ** 252 - 1
-    sigma_ann = sigma_daily * np.sqrt(252)
-    if not np.isfinite(mu_ann) or not np.isfinite(sigma_ann) or sigma_ann <= 0:
-        return None, "Could not estimate drift/volatility."
-    current = float(s.iloc[-1])
-    steps = int(252 * years_ahead); dt = 1.0/252.0
-    rng = np.random.default_rng(seed)
-    Z = rng.standard_normal(size=(steps, n_paths))
-    drift = (mu_ann - 0.5 * sigma_ann**2) * dt
-    diff = sigma_ann * np.sqrt(dt) * Z
-    log_cum = np.cumsum(drift + diff, axis=0)
-    end_values = current * np.exp(log_cum[-1, :])
-    p5, p50, p95 = np.percentile(end_values, [5,50,95]).tolist()
-    def to_cagr(v_end, v_start, yrs):
-        return (v_end/v_start)**(1/yrs) - 1 if v_start>0 and yrs>0 else np.nan
-    out = {
-        "current_value": current,
-        "p5_value": p5, "p50_value": p50, "p95_value": p95,
-        "cagr_p5": to_cagr(p5,current,years_ahead),
-        "cagr_p50": to_cagr(p50,current,years_ahead),
-        "cagr_p95": to_cagr(p95,current,years_ahead),
-        "end_values": end_values
+def convert_prices_to_base(prices: pd.DataFrame, tickers: list, base_ccy: str, start: datetime, end: datetime, interval="1d"):
+    """Convert each asset column to base currency using detected currency and Yahoo FX pairs."""
+    if prices.empty:
+        return prices, {t: "?" for t in tickers}, {}
+
+    asset_ccy = {}
+    for t in tickers:
+        asset_ccy[t] = detect_currency(t)
+
+    # Build FX dict and convert
+    fx_cache = {}
+    conv = pd.DataFrame(index=prices.index)
+    for t in tickers:
+        ccy = asset_ccy.get(t, "USD").upper()
+        fx_key = (ccy, base_ccy.upper())
+        if fx_key not in fx_cache:
+            fx_cache[fx_key] = fetch_fx_pair_series(ccy, base_ccy, start, end, interval=interval)
+        fx = fx_cache[fx_key]
+        # Align indices; forward-fill
+        fx_aligned = fx.reindex(conv.index).ffill()
+        conv[t] = prices[t] * fx_aligned
+    return conv, asset_ccy, {f"{k[0]}->{k[1]}": v for k, v in fx_cache.items()}
+
+def tracking_error(a_ret: pd.Series, b_ret: pd.Series, per_year=252):
+    df = pd.concat([a_ret, b_ret], axis=1).dropna()
+    if df.shape[0] < 3:
+        return np.nan
+    diff = df.iloc[:, 0] - df.iloc[:, 1]
+    return diff.std(ddof=0) * np.sqrt(per_year)
+
+def beta_alpha(asset: pd.Series, bench: pd.Series, per_year=252):
+    df = pd.concat([asset, bench], axis=1).dropna()
+    if df.shape[0] < 3 or df.iloc[:, 1].std(ddof=0) == 0:
+        return (np.nan, np.nan, np.nan)
+    x = df.iloc[:, 1].values
+    y = df.iloc[:, 0].values
+    X = np.column_stack([np.ones_like(x), x])  # intercept + single factor
+    # OLS: b = (X'X)^-1 X'y
+    try:
+        beta_hat = np.linalg.lstsq(X, y, rcond=None)[0]
+        alpha_per = beta_hat[0]
+        beta1 = beta_hat[1]
+        # R^2
+        yhat = X @ beta_hat
+        ss_res = np.sum((y - yhat) ** 2)
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
+        alpha_ann = (1 + alpha_per) ** per_year - 1
+        return (beta1, alpha_ann, r2)
+    except Exception:
+        return (np.nan, np.nan, np.nan)
+
+def multi_factor_ols(y: pd.Series, X_df: pd.DataFrame, per_year=252):
+    """OLS with intercept; returns dict(alpha_ann, betas{col:beta}, r2)."""
+    df = pd.concat([y.rename("y"), X_df], axis=1).dropna()
+    if df.shape[0] < (X_df.shape[1] + 2):
+        return {"alpha_ann": np.nan, "betas": {c: np.nan for c in X_df.columns}, "r2": np.nan}
+    Y = df["y"].values
+    X = df[X_df.columns].values
+    # Add intercept
+    X_ = np.column_stack([np.ones(X.shape[0]), X])
+    try:
+        b = np.linalg.lstsq(X_, Y, rcond=None)[0]
+        alpha_per = b[0]
+        betas = {col: b[i+1] for i, col in enumerate(X_df.columns)}
+        yhat = X_ @ b
+        ss_res = np.sum((Y - yhat) ** 2)
+        ss_tot = np.sum((Y - Y.mean()) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
+        alpha_ann = (1 + alpha_per) ** per_year - 1
+        return {"alpha_ann": alpha_ann, "betas": betas, "r2": r2}
+    except Exception:
+        return {"alpha_ann": np.nan, "betas": {c: np.nan for c in X_df.columns}, "r2": np.nan}
+
+def make_pdf_report(buffer: io.BytesIO, title: str, summary_blocks: list, tables: dict):
+    """Write a simple PDF; returns True on success."""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+        doc = SimpleDocTemplate(buffer, pagesize=A4)
+        styles = getSampleStyleSheet()
+        story = [Paragraph(title, styles["Title"]), Spacer(1, 12)]
+        for head, items in summary_blocks:
+            story.append(Paragraph(f"<b>{head}</b>", styles["Heading2"]))
+            for k, v in items.items():
+                story.append(Paragraph(f"{k}: {v}", styles["Normal"]))
+            story.append(Spacer(1, 8))
+        for name, df in tables.items():
+            story.append(Paragraph(f"<b>{name}</b>", styles["Heading3"]))
+            tdata = [df.columns.tolist()] + df.astype(str).values.tolist()
+            tbl = Table(tdata, hAlign="LEFT")
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+                ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+                ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+            ]))
+            story.append(tbl)
+            story.append(Spacer(1, 8))
+        doc.build(story)
+        return True
+    except Exception:
+        return False
+
+def summarize_portfolio(name, weights, prices_base, rf, interval):
+    """Compute returns/metrics for a single portfolio dict with keys: tickers(list), weights(list)"""
+    tickers = name["tickers"]
+    w = np.array(name["weights"], dtype=float)
+    w = w / w.sum()
+    pr = prices_base[tickers].dropna(how="all")
+    rets = pr.pct_change().dropna(how="all")
+    # Portfolio
+    port_ret = (rets * w).sum(axis=1).rename(f"{name['label']}_ret")
+    # Asset metrics
+    rows = []
+    for i, t in enumerate(tickers):
+        s = pr[t].dropna()
+        r = rets[t].dropna()
+        rows.append({
+            "Ticker": t,
+            "Weight": w[i],
+            "CAGR": cagr_from_prices(s),
+            "Annual Vol": ann_vol(r),
+            "Sharpe": sharpe(r, rf=rf),
+            "Max Drawdown": max_drawdown_from_returns(r),
+        })
+    mdf = pd.DataFrame(rows)
+    # Portfolio metrics
+    pm = {
+        "CAGR": cagr_from_prices((pr @ w)),
+        "Annual Vol": ann_vol(port_ret),
+        "Sharpe": sharpe(port_ret, rf=rf),
+        "Max Drawdown": max_drawdown_from_returns(port_ret),
     }
-    return out, None
+    return pr, rets, port_ret, mdf, pm
 
-# ---------- Sidebar ----------
+def fmt_pct(x, digits=2):
+    return "—" if x is None or not _np_isfinite(x) else f"{x:.{digits}%}"
+
+def fmt_num(x, digits=2):
+    return "—" if x is None or not _np_isfinite(x) else f"{x:.{digits}f}"
+
+# ---------------- Sidebar: Global Config ----------------
 with st.sidebar:
-    st.header("Settings")
-    benchmark = st.text_input("Benchmark", value="^GSPC")
-    risk_free = st.number_input("Risk-free rate (annual)", value=0.02, step=0.005, format="%.4f")
-    target_currency = st.text_input("Display currency (USD, GBP, EUR, INR, etc.)", value="USD")
-st.caption("Tip: Enter global tickers (AAPL, MSFT, NVDA, TSLA, RIO.L, RELIANCE.NS).")
+    st.header("⚙️ Configuration")
 
-# ---------- Inputs ----------
-c1, c2 = st.columns(2)
-with c1:
-    tickers_input = st.text_input("Tickers (comma-separated)", value="AAPL, MSFT, NVDA")
-    start_date = st.date_input("Start date", value=datetime(2022,1,1))
-with c2:
-    amounts_input = st.text_input("Invested amounts (same order)", value="4000, 3500, 2500")
-    end_date = st.date_input("End date", value=datetime.today())
+    base_currency = st.selectbox("Base currency", ["USD", "INR", "EUR", "GBP"], index=1)  # default INR for your use case
+    interval = st.selectbox("Price interval", ["1d", "1wk", "1mo"], index=0)
+    rf_rate = st.number_input("Risk-free rate (annual, %)", value=0.0, step=0.25) / 100.0
+    var_cl = st.slider("VaR/CVaR Confidence", min_value=0.80, max_value=0.999, value=0.95, step=0.01)
 
-# ---------- Analyze ----------
-if st.button("Analyze"):
-    import traceback
+    d1, d2 = st.columns(2)
+    with d1:
+        start_dt = st.date_input("Start date", value=(date.today() - timedelta(days=365*3)))
+    with d2:
+        end_dt = st.date_input("End date", value=date.today())
+
+# ---------------- Sidebar: Portfolio A ----------------
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("🅰️ Portfolio A")
+    a_tickers_text = st.text_input("A: Tickers", value="AAPL, MSFT")
+    a_tickers = [t.strip() for t in a_tickers_text.split(",") if t.strip()]
+    a_weights_text = st.text_input("A: Weights", value=", ".join([str(round(1/len(a_tickers), 4)) for _ in a_tickers]) if a_tickers else "")
     try:
-        tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-        amounts = [float(x.strip()) for x in amounts_input.split(",") if x.strip()]
-        if len(tickers) != len(amounts):
-            st.error("Tickers and amounts count must match."); st.stop()
+        a_weights = [float(x.strip()) for x in a_weights_text.split(",")] if a_weights_text else []
+    except Exception:
+        a_weights = []
 
-        # Validate (with suggestions)
-        valid, invalid, suggestions = validate_and_suggest(tickers)
-        if invalid:
-            msg = "Invalid or no recent data: " + ", ".join(invalid)
-            if suggestions:
-                tips = "; ".join([f"{k} -> {', '.join(v)}" for k,v in suggestions.items()])
-                msg += " | Suggestions: " + tips
-            st.warning(msg)
-        if not valid: st.error("No valid tickers to analyze."); st.stop()
-        tickers = valid
-
-        # Prices
-        prices = fetch_adj_close(tickers, start_date, end_date)
-        if prices.empty: st.error("No price data returned."); st.stop()
-
-        available = [t for t in tickers if t in prices.columns]
-        if not available: st.error("No valid tickers with data."); st.stop()
-        prices = prices[available]
-        amounts_aligned = [a for (t,a) in zip(tickers, amounts) if t in available]
-        amounts_map = dict(zip(available, amounts_aligned))
-
-        # Per-ticker currency conversion to display currency (robust)
-        currency_map = {t: cached_currency(t) for t in prices.columns}
-        prices = convert_prices_to_target_robust(prices, start_date, end_date, target_currency, currency_map, on_fail="error")
-        if prices.empty: st.error("Currency conversion failed for all tickers."); st.stop()
-
-        # Portfolio series & metrics
-        port = portfolio_series(prices, amounts_map)
-        if port.empty: st.error("Could not build portfolio series."); st.stop()
-
-        total_invested = float(sum(amounts_aligned))
-        current_value = float(port.iloc[-1])
-        abs_return = (current_value - total_invested)/total_invested if total_invested>0 else np.nan
-        cagr_val = cagr(total_invested, current_value, to_dt(start_date), to_dt(end_date))
-        daily = port.pct_change().dropna()
-        vol_ann = annualize_vol(daily)
-
-        # Benchmark & beta
-        bench = fetch_adj_close([benchmark], start_date, end_date)
-        if not bench.empty:
-            bser = bench[benchmark] if benchmark in bench.columns else bench.iloc[:,0]
-            beta_val = compute_beta(daily, bser.pct_change().dropna())
-        else:
-            beta_val = np.nan
-            st.warning("Benchmark data unavailable; beta not computed.")
-
-        # Sharpe
-        if not daily.empty and vol_ann and not np.isnan(vol_ann):
-            ann_ret = (1 + daily).prod() ** (252/len(daily)) - 1
-            sharpe = (ann_ret - risk_free) / vol_ann
-        else:
-            sharpe = np.nan
-
-        # KPIs
-        k1,k2,k3,k4,k5 = st.columns(5)
-        k1.metric("Invested", f"{target_currency} {total_invested:,.2f}")
-        k2.metric("Current", f"{target_currency} {current_value:,.2f}")
-        k3.metric("Abs. Return", f"{abs_return*100:,.2f}%")
-        k4.metric("CAGR", f"{cagr_val*100:,.2f}%")
-        k5.metric("Volatility (ann.)", f"{(vol_ann*100) if vol_ann==vol_ann else 0:.2f}%")
-        k6,k7 = st.columns(2)
-        k6.metric("Sharpe", f"{sharpe:.3f}" if sharpe==sharpe else "—")
-        k7.metric("Beta vs Benchmark", f"{beta_val:.3f}" if beta_val==beta_val else "—")
-
-        st.subheader("Portfolio value (display currency)")
-        st.line_chart(port, height=320)
-
-        # Sector allocation by invested weights
-        st.subheader("Sector allocation")
-        weights = {t: (amt/total_invested if total_invested>0 else 0.0) for t, amt in amounts_map.items()}
-        sectors_map = get_sectors(list(weights.keys()))
-        sec = {}
-        for t, w in weights.items():
-            sct = sectors_map.get(t, "Unknown") or "Unknown"
-            sec[sct] = sec.get(sct, 0.0) + w
-        sec_df = pd.DataFrame([{"sector":k,"weight":v} for k,v in sec.items()]).sort_values("weight", ascending=False)
-        if not sec_df.empty:
-            st.bar_chart(sec_df.set_index("sector"))
-            st.dataframe(sec_df.assign(weight_pct=(sec_df["weight"]*100).round(2)))
-        else:
-            st.info("No sector data found.")
-
-        # Downloads
-        def _kpis_df():
-            return pd.DataFrame([{
-                "currency": target_currency,
-                "invested": round(total_invested,2),
-                "current": round(current_value,2),
-                "abs_return_pct": round(abs_return*100,2) if pd.notna(abs_return) else None,
-                "cagr_pct": round(cagr_val*100,2) if pd.notna(cagr_val) else None,
-                "vol_ann_pct": round(vol_ann*100,2) if pd.notna(vol_ann) else None,
-                "sharpe": round(sharpe,3) if pd.notna(sharpe) else None,
-                "beta": round(beta_val,3) if pd.notna(beta_val) else None
-            }])
-
-        def _csv_bytes(df): return df.to_csv(index=False).encode("utf-8")
-        def _xlsx_bytes(df, sheet="KPIs"):
-            import io
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-                df.to_excel(w, index=False, sheet_name=sheet)
-            buf.seek(0); return buf.getvalue()
-
-        kdf = _kpis_df()
-        d1, d2 = st.columns(2)
-        with d1:
-            st.download_button("Download KPIs (CSV)", data=_csv_bytes(kdf), file_name="kpis_single.csv", mime="text/csv")
-        with d2:
-            st.download_button("Download KPIs (Excel)", data=_xlsx_bytes(kdf), file_name="kpis_single.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    except Exception as ex:
-        import traceback
-        st.error(f"Analysis failed: {ex}")
-        st.code(traceback.format_exc())
-
-# ---------- Monte Carlo ----------
-st.header("Monte Carlo simulation")
-colA,colB,colC = st.columns(3)
-with colA:
-    sim_years = st.number_input("Years ahead", 1, 30, 5, 1)
-with colB:
-    sim_paths = st.number_input("Number of paths", 500, 50000, 5000, 500)
-with colC:
-    sim_seed = st.number_input("Random seed", 0, 999999, 42, 1)
-
-if st.button("Run simulation"):
+# ---------------- Sidebar: Portfolio B ----------------
+with st.sidebar:
+    st.subheader("🅱️ Portfolio B (optional)")
+    b_tickers_text = st.text_input("B: Tickers", value="^NSEI, ^BSESN")
+    b_tickers = [t.strip() for t in b_tickers_text.split(",") if t.strip()]
+    b_weights_text = st.text_input("B: Weights", value=", ".join([str(round(1/len(b_tickers), 4)) for _ in b_tickers]) if b_tickers else "")
     try:
-        tickers = [t.strip().upper() for t in (tickers_input or "").split(",") if t.strip()]
-        amounts = [float(x.strip()) for x in (amounts_input or "").split(",") if x.strip()]
-        if len(tickers) != len(amounts) or len(tickers) == 0:
-            st.error("Please fill tickers and amounts above, then click Analyze first."); st.stop()
+        b_weights = [float(x.strip()) for x in b_weights_text.split(",")] if b_weights_text else []
+    except Exception:
+        b_weights = []
 
-        prices_sim = fetch_adj_close(tickers, start_date, end_date)
-        if prices_sim.empty: st.error("No price data for simulation."); st.stop()
-        available = [t for t in tickers if t in prices_sim.columns]
-        if not available: st.error("No valid tickers for simulation."); st.stop()
-        prices_sim = prices_sim[available]
-        amounts = [a for (t,a) in zip(tickers,amounts) if t in available]
-        amounts_map_sim = dict(zip(available, amounts))
+# ---------------- Sidebar: Benchmarks for Analysis ----------------
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("🧭 Benchmarks / Factors")
+    bench_opts = {
+        "^NSEI": "NIFTY 50",
+        "^BSESN": "SENSEX",
+        "^GSPC": "S&P 500",
+        "^NDX": "Nasdaq 100",
+        "^FTSE": "FTSE 100",
+        "^STOXX50E": "Euro Stoxx 50",
+        "^N225": "Nikkei 225",
+        "^HSI": "Hang Seng",
+    }
+    selected_bench = st.multiselect(
+        "Select up to 4 benchmarks for comparison & factor regression",
+        options=list(bench_opts.keys()),
+        default=["^NSEI", "^BSESN"],
+        max_selections=4,
+        format_func=lambda x: f"{x} ({bench_opts.get(x,'')})"
+    )
 
-        currency_map_sim = {t: cached_currency(t) for t in prices_sim.columns}
-        prices_sim = convert_prices_to_target_robust(prices_sim, start_date, end_date, target_currency, currency_map_sim, on_fail="error")
-        if prices_sim.empty: st.error("Currency conversion failed for simulation."); st.stop()
+    run_btn = st.button("Run Analysis")
 
-        port_sim = portfolio_series(prices_sim, amounts_map_sim)
-        out, err = simulate_gbm_from_series(port_sim, years_ahead=int(sim_years), n_paths=int(sim_paths), seed=int(sim_seed))
-        if err: st.error(err); st.stop()
+# ---------------- Main Logic ----------------
+if run_btn:
+    start = to_dt(start_dt)
+    end = to_dt(end_dt)
+    if start >= end:
+        st.error("Start date must be before end date.")
+        st.stop()
 
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("Current", f"{target_currency} {out['current_value']:,.2f}")
-        m2.metric("P5", f"{target_currency} {out['p5_value']:,.2f}")
-        m3.metric("P50", f"{target_currency} {out['p50_value']:,.2f}")
-        m4.metric("P95", f"{target_currency} {out['p95_value']:,.2f}")
+    # Validate portfolio inputs
+    if not a_tickers or not a_weights or len(a_tickers) != len(a_weights):
+        st.error("Portfolio A: please provide tickers and matching weights.")
+        st.stop()
+    use_B = bool(b_tickers) and bool(b_weights) and len(b_tickers) == len(b_weights)
 
-        n1,n2,n3 = st.columns(3)
-        n1.metric("CAGR P5",  f"{out['cagr_p5']*100:.2f}%")
-        n2.metric("CAGR P50", f"{out['cagr_p50']*100:.2f}%")
-        n3.metric("CAGR P95", f"{out['cagr_p95']*100:.2f}%")
+    # Download asset prices (union of A and B)
+    all_tickers = list(dict.fromkeys(a_tickers + (b_tickers if use_B else [])))
+    raw_prices = safe_download_prices(all_tickers, start, end, interval=interval)
+    if raw_prices.empty:
+        st.error("No price data returned. Check tickers/date range.")
+        st.stop()
 
-        # Histogram
-        ev = out["end_values"]
-        counts, bins = np.histogram(ev, bins=40)
-        mids = (bins[:-1] + bins[1:]) / 2.0
-        hist_df = pd.DataFrame({"end_value": mids, "count": counts}).set_index("end_value")
-        st.subheader("Distribution of simulated end values")
-        st.bar_chart(hist_df)
+    # Convert to base currency
+    conv_prices, asset_ccy_map, fx_map = convert_prices_to_base(raw_prices, all_tickers, base_currency, start, end, interval=interval)
 
-        # Downloads
-        sim_summary = pd.DataFrame([{
-            "current_value": round(out["current_value"],2),
-            "p5_value": round(out["p5_value"],2),
-            "p50_value": round(out["p50_value"],2),
-            "p95_value": round(out["p95_value"],2),
-            "cagr_p5_pct": round(out["cagr_p5"]*100,2),
-            "cagr_p50_pct": round(out["cagr_p50"]*100,2),
-            "cagr_p95_pct": round(out["cagr_p95"]*100,2),
-        }])
-        def _csv_bytes(df): return df.to_csv(index=False).encode("utf-8")
-        def _xlsx_bytes(df, sheet="Simulation"):
-            import io
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-                df.to_excel(w, index=False, sheet_name=sheet)
-            buf.seek(0); return buf.getvalue()
-        s1,s2 = st.columns(2)
-        with s1:
-            st.download_button("Download simulation (CSV)", data=_csv_bytes(sim_summary),
-                               file_name="simulation_summary.csv", mime="text/csv")
-        with s2:
-            st.download_button("Download simulation (Excel)", data=_xlsx_bytes(sim_summary),
-                               file_name="simulation_summary.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception as ex:
-        import traceback
-        st.error(f"Simulation failed: {ex}")
-        st.code(traceback.format_exc())
+    with st.expander("💱 Currency details", expanded=False):
+        st.write(f"**Base currency:** {base_currency}")
+        st.dataframe(
+            pd.DataFrame({"Ticker": list(asset_ccy_map.keys()), "Detected Currency": list(asset_ccy_map.values())}),
+            width="content"
+        )
+
+    # Prices per portfolio
+    a_spec = {"label": "A", "tickers": a_tickers, "weights": a_weights}
+    A_prices = conv_prices[a_tickers].dropna(how="all")
+
+    # Download benchmarks and convert to base currency too
+    bench_prices_native = safe_download_prices(selected_bench, start, end, interval=interval) if selected_bench else pd.DataFrame()
+    if not bench_prices_native.empty:
+        # Benchmarks: detect currencies individually (usually native)
+        bench_conv = []
+        for b in selected_bench:
+            bc = detect_currency(b)
+            fx_b = fetch_fx_pair_series(bc, base_currency, start, end, interval=interval)
+            bench_conv.append((bench_prices_native[b] * fx_b.reindex(bench_prices_native.index).ffill()).rename(b))
+        bench_prices = pd.concat(bench_conv, axis=1).dropna(how="all")
+        bench_rets = bench_prices.pct_change().dropna(how="all")
+    else:
+        bench_prices = pd.DataFrame()
+        bench_rets = pd.DataFrame()
+
+    # Compute Portfolio A metrics
+    A_prices, A_rets, A_port_ret, A_metrics_df, A_pm = summarize_portfolio(a_spec, conv_prices, rf_rate, interval)
+
+    # Optional Portfolio B
+    if use_B:
+        b_spec = {"label": "B", "tickers": b_tickers, "weights": b_weights}
+        B_prices, B_rets, B_port_ret, B_metrics_df, B_pm = summarize_portfolio(b_spec, conv_prices, rf_rate, interval)
+    else:
+        B_prices = pd.DataFrame(); B_rets = pd.DataFrame()
+        B_port_ret = pd.Series(dtype=float, name="B_ret")
+        B_metrics_df = pd.DataFrame(); B_pm = {}
+
+    # ---------- Top Summary ----------
+    st.subheader("📌 Portfolio Summaries (base: " + base_currency + ")")
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+    c1.metric("A CAGR", fmt_pct(A_pm.get("CAGR")))
+    c2.metric("A Vol", fmt_pct(A_pm.get("Annual Vol")))
+    c3.metric("A Sharpe", fmt_num(A_pm.get("Sharpe")))
+    c4.metric("A MaxDD", fmt_pct(A_pm.get("Max Drawdown")))
+    if use_B:
+        c5.metric("B CAGR", fmt_pct(B_pm.get("CAGR")))
+        c6.metric("B Vol", fmt_pct(B_pm.get("Annual Vol")))
+        c7.metric("B Sharpe", fmt_num(B_pm.get("Sharpe")))
+        c8.metric("B MaxDD", fmt_pct(B_pm.get("Max Drawdown")))
+
+    st.subheader("🧮 Asset Metrics")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Portfolio A**")
+        dfA = A_metrics_df.copy()
+        for col in ["CAGR", "Annual Vol", "Sharpe", "Max Drawdown", "Weight"]:
+            if col == "Sharpe":
+                dfA[col] = dfA[col].map(lambda x: fmt_num(x))
+            elif col == "Weight":
+                dfA[col] = dfA[col].map(lambda x: fmt_pct(x))
+            else:
+                dfA[col] = dfA[col].map(lambda x: fmt_pct(x))
+        st.dataframe(dfA, width="stretch")
+    with right:
+        st.markdown("**Portfolio B**")
+        if not B_metrics_df.empty:
+            dfB = B_metrics_df.copy()
+            for col in ["CAGR", "Annual Vol", "Sharpe", "Max Drawdown", "Weight"]:
+                if col == "Sharpe":
+                    dfB[col] = dfB[col].map(lambda x: fmt_num(x))
+                elif col == "Weight":
+                    dfB[col] = dfB[col].map(lambda x: fmt_pct(x))
+                else:
+                    dfB[col] = dfB[col].map(lambda x: fmt_pct(x))
+            st.dataframe(dfB, width="stretch")
+        else:
+            st.info("No Portfolio B configured.", icon="ℹ️")
+
+    # ---------- Charts ----------
+    st.subheader("📈 Charts")
+
+    # Prices (converted to base)
+    fig_price = px.line(conv_prices[all_tickers], x=conv_prices.index, y=all_tickers, title=f"Converted Prices in {base_currency}")
+    fig_price.update_layout(legend_title_text="")
+    st.plotly_chart(fig_price, width="stretch")
+
+    # Cumulative returns for A & B
+    cum_df = pd.DataFrame(index=A_rets.index)
+    cum_df["A"] = (1 + A_port_ret).cumprod()
+    if use_B and not B_port_ret.empty:
+        br = B_port_ret.reindex(cum_df.index).dropna()
+        cum_df = cum_df.join((1 + br).cumprod().rename("B"), how="left")
+    if not bench_rets.empty:
+        for b in bench_rets.columns:
+            cum_df[b] = (1 + bench_rets[b].reindex(cum_df.index)).cumprod()
+    fig_cum = px.line(cum_df.dropna(how="all"), x=cum_df.index, y=cum_df.columns, title="Cumulative Returns")
+    fig_cum.update_layout(legend_title_text="")
+    st.plotly_chart(fig_cum, width="stretch")
+
+    # Risk/Return bubble (assets in A & B)
+    rr_rows = []
+    for label, prc, rts, tickers, wts in [
+        ("A", A_prices, A_rets, a_tickers, np.array(a_weights)/np.sum(a_weights)),
+        ("B", B_prices, B_rets, b_tickers, np.array(b_weights)/np.sum(b_weights) if use_B else np.array([]))
+    ]:
+        if prc.empty:
+            continue
+        for i, t in enumerate(tickers):
+            r = rts[t].dropna()
+            rr_rows.append({
+                "Portfolio": label,
+                "Ticker": t,
+                "Annual Vol": ann_vol(r),
+                "CAGR": cagr_from_prices(prc[t]),
+                "Weight": (wts[i] if len(wts) > i else np.nan)
+            })
+    rr_df = pd.DataFrame(rr_rows)
+    if not rr_df.empty:
+        fig_bubble = px.scatter(
+            rr_df, x="Annual Vol", y="CAGR", size="Weight", color="Portfolio", text="Ticker",
+            title="Risk / Return by Asset (Bubble=size weight)"
+        )
+        fig_bubble.update_traces(textposition="top center")
+        fig_bubble.update_layout(xaxis_tickformat=".1%", yaxis_tickformat=".1%", legend_title_text="")
+        st.plotly_chart(fig_bubble, width="stretch")
+
+    # ---------- Risk: VaR / CVaR ----------
+    st.subheader("⚠️ Risk: Historical VaR / CVaR")
+    var_rows = []
+    A_var, A_cvar = hist_var_cvar(A_port_ret, cl=var_cl)
+    var_rows.append(["Portfolio A", fmt_pct(A_var), fmt_pct(A_cvar)])
+    if use_B and not B_port_ret.empty:
+        B_var, B_cvar = hist_var_cvar(B_port_ret, cl=var_cl)
+        var_rows.append(["Portfolio B", fmt_pct(B_var), fmt_pct(B_cvar)])
+    var_df = pd.DataFrame(var_rows, columns=["Portfolio", f"VaR ({int(var_cl*100)}%)", f"CVaR ({int(var_cl*100)}%)"])
+    st.dataframe(var_df, width="content")
+
+    # ---------- Factor / Beta Decomposition ----------
+    st.subheader("🧮 Factor / Beta Decomposition vs Benchmarks")
+    if not bench_rets.empty:
+        # Single-factor per benchmark (A and B) + Multi-factor (all selected)
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("**Portfolio A vs each benchmark (single-factor)**")
+            s_rows = []
+            for b in bench_rets.columns:
+                b1, a1, r2 = beta_alpha(A_port_ret, bench_rets[b])
+                s_rows.append([bench_opts.get(b, b), fmt_num(b1), fmt_pct(a1), fmt_num(r2)])
+            st.dataframe(pd.DataFrame(s_rows, columns=["Benchmark", "Beta", "Alpha (annual)", "R²"]), width="content")
+
+        with cols[1]:
+            st.markdown("**Portfolio B vs each benchmark (single-factor)**")
+            if use_B and not B_port_ret.empty:
+                s_rows = []
+                for b in bench_rets.columns:
+                    b1, a1, r2 = beta_alpha(B_port_ret, bench_rets[b])
+                    s_rows.append([bench_opts.get(b, b), fmt_num(b1), fmt_pct(a1), fmt_num(r2)])
+                st.dataframe(pd.DataFrame(s_rows, columns=["Benchmark", "Beta", "Alpha (annual)", "R²"]), width="content")
+            else:
+                st.info("No Portfolio B configured.", icon="ℹ️")
+
+        # Multi-factor (all selected together)
+        st.markdown("**Multi-factor regression (all selected benchmarks together)**")
+        X = bench_rets.copy()
+        A_mf = multi_factor_ols(A_port_ret, X)
+        mf_rows = [["Alpha (annual)", fmt_pct(A_mf["alpha_ann"])], ["R²", fmt_num(A_mf["r2"])]]
+        for k, v in A_mf["betas"].items():
+            mf_rows.append([f"β vs {bench_opts.get(k, k)}", fmt_num(v)])
+        st.dataframe(pd.DataFrame(mf_rows, columns=["Metric", "Value"]), width="content")
+
+        if use_B and not B_port_ret.empty:
+            B_mf = multi_factor_ols(B_port_ret, X)
+            mf_rows_b = [["Alpha (annual)", fmt_pct(B_mf["alpha_ann"])], ["R²", fmt_num(B_mf["r2"])]]
+            for k, v in B_mf["betas"].items():
+                mf_rows_b.append([f"β vs {bench_opts.get(k, k)}", fmt_num(v)])
+            st.dataframe(pd.DataFrame(mf_rows_b, columns=["Metric", "Value"]), width="content")
+    else:
+        st.info("Select at least one benchmark to see factor/beta decomposition.", icon="ℹ️")
+
+    # ---------- Downloads ----------
+    st.subheader("⬇️ Downloads")
+    # Export combined data
+    export = pd.concat({
+        "Prices (base)": conv_prices,
+        "A returns": A_rets,
+        "B returns": B_rets if use_B else pd.DataFrame(index=conv_prices.index),
+        "Bench returns": bench_rets if not bench_rets.empty else pd.DataFrame(index=conv_prices.index)
+    }, axis=1)
+    csv_buf = io.StringIO()
+    export.to_csv(csv_buf)
+    st.download_button("Download CSV (prices & returns)", data=csv_buf.getvalue(), file_name="portfolio_pro_data.csv", mime="text/csv")
+
+    # PDF report (summary + tables)
+    pdf_buf = io.BytesIO()
+    A_sum = {k: (fmt_pct(v) if "Vol" in k or "CAGR" in k or "Drawdown" in k else (fmt_num(v) if k=="Sharpe" else v)) for k, v in A_pm.items()}
+    blocks = [("Portfolio A Summary", A_sum)]
+    if use_B:
+        B_sum = {k: (fmt_pct(v) if "Vol" in k or "CAGR" in k or "Drawdown" in k else (fmt_num(v) if k=="Sharpe" else v)) for k, v in B_pm.items()}
+        blocks.append(("Portfolio B Summary", B_sum))
+    tables = {"Asset Metrics - A": dfA}
+    if use_B and not B_metrics_df.empty:
+        tables["Asset Metrics - B"] = dfB
+    ok = make_pdf_report(pdf_buf, "Portfolio Analyzer Pro Report", blocks, tables)
+    if ok:
+        st.download_button("Download PDF Report", data=pdf_buf.getvalue(), file_name="portfolio_pro_report.pdf", mime="application/pdf")
+    else:
+        html = io.StringIO()
+        html.write("<h1>Portfolio Analyzer Pro Report</h1>")
+        for head, items in blocks:
+            html.write(f"<h2>{head}</h2><ul>")
+            for k, v in items.items():
+                html.write(f"<li><b>{k}</b>: {v}</li>")
+            html.write("</ul>")
+        html.write("<h2>Asset Metrics - A</h2>")
+        html.write(dfA.to_html(index=False))
+        if use_B and not B_metrics_df.empty:
+            html.write("<h2>Asset Metrics - B</h2>")
+            html.write(dfB.to_html(index=False))
+        st.download_button("Download HTML Report", data=html.getvalue().encode("utf-8"),
+                           file_name="portfolio_pro_report.html", mime="text/html")
+
+else:
+    st.info("Set base currency, portfolios, dates, and click **Run Analysis**.", icon="🛠️")
