@@ -1,7 +1,6 @@
-﻿
- streamlit
+streamlit
 yfinance
 pandas
 numpy
-xlsxwriter
-altair
+plotly
+reportlab
